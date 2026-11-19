@@ -1,0 +1,43 @@
+{
+  "RoleDetailList": [
+    {
+      "Arn": "arn:aws:iam::111122223333:role/ci",
+      "AssumeRolePolicyDocument": {
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Federated": "arn:aws:iam::111122223333:oidc-provider/token.actions.githubusercontent.com"},
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"},
+            "StringLike": {"token.actions.githubusercontent.com:sub": "repo:example/demo:*"}
+          }
+        }]
+      },
+      "RolePolicyList": [{
+        "PolicyDocument": {"Statement": [{
+          "Effect": "Allow",
+          "Action": "sts:AssumeRole",
+          "Resource": "arn:aws:iam::111122223333:role/deploy"
+        }]}
+      }]
+    },
+    {
+      "Arn": "arn:aws:iam::111122223333:role/deploy",
+      "AssumeRolePolicyDocument": {
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"AWS": "arn:aws:iam::111122223333:role/ci"},
+          "Action": "sts:AssumeRole"
+        }, {
+          "Effect": "Allow",
+          "Principal": {"Federated": "arn:aws:iam::111122223333:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE"},
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringLike": {"oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE:sub": "system:serviceaccount:demo:*"}
+          }
+        }]
+      },
+      "AttachedManagedPolicies": [{"PolicyArn": "arn:aws:iam::aws:policy/AdministratorAccess"}]
+    }
+  ]
+}

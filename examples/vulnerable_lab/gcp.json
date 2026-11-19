@@ -1,0 +1,7 @@
+{
+  "resource": "projects/demo-project/serviceAccounts/ci@demo-project.iam.gserviceaccount.com",
+  "bindings": [{
+    "role": "roles/iam.workloadIdentityUser",
+    "members": ["serviceAccount:demo-project.svc.id.goog[demo/runner]"]
+  }]
+}
