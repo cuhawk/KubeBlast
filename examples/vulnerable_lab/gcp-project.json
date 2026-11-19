@@ -1,0 +1,7 @@
+{
+  "resource": "projects/demo-project",
+  "bindings": [{
+    "role": "roles/owner",
+    "members": ["serviceAccount:ci@demo-project.iam.gserviceaccount.com"]
+  }]
+}
