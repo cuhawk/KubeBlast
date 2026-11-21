@@ -19,4 +19,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install '.[test]'
+      - name: Install policy validators
+        run: |
+          mkdir -p "$RUNNER_TEMP/policy-tools"
+          cd "$RUNNER_TEMP/policy-tools"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/open-policy-agent/opa/releases/download/v1.4.2/opa_linux_amd64_static \
+            --output opa
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/kyverno/kyverno/releases/download/v1.17.0/kyverno-cli_v1.17.0_linux_x86_64.tar.gz \
+            --output kyverno.tar.gz
+          sha256sum --check <<'CHECKSUMS'
+          2c0ccdbbe0b8e2a5d12d9c42d92f1f34f494ffb32d1f3c4ddc36101be637d66f  opa
+          f3ed671574fcca224e30c259131e524b0594f84f864c7c5087cdcfdae6d605e2  kyverno.tar.gz
+          CHECKSUMS
+          chmod +x opa
+          tar -xzf kyverno.tar.gz kyverno
+          echo "$RUNNER_TEMP/policy-tools" >> "$GITHUB_PATH"
       - run: python -m pytest
+      - run: python benchmarks/run_bench.py --repetitions 2

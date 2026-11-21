@@ -1,4 +1,4 @@
-from ..models import GitHubOIDC, Inventory
+from ..models import GitHubOIDC, Inventory, K8sServiceAccount
 
 ISSUER = "token.actions.githubusercontent.com"
 
@@ -34,3 +34,9 @@ def parse_trust(statements, role: str, inventory: Inventory, evidence: str) -> N
                 source, role, "github_oidc", evidence, scope=subject,
                 conditional=explicit_deny or bool(conditions), finding=broad,
             )
+
+
+def workload_account(inventory: Inventory, namespace: str, name: str) -> str:
+    return inventory.add(K8sServiceAccount(
+        id=f"k8s:sa:{namespace}:{name}", label=f"{namespace}/{name}",
+    ))

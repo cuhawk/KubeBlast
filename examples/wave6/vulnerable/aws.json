@@ -1,0 +1,21 @@
+{
+  "association": {
+    "clusterName": "demo",
+    "namespace": "demo",
+    "serviceAccount": "runner",
+    "roleArn": "arn:aws:iam::111122223333:role/demo"
+  },
+  "RoleDetailList": [{
+    "Arn": "arn:aws:iam::111122223333:role/demo",
+    "AssumeRolePolicyDocument": {"Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "pods.eks.amazonaws.com"},
+      "Action": ["sts:AssumeRole", "sts:TagSession"]
+    }]},
+    "RolePolicyList": [{"PolicyDocument": {"Statement": [{
+      "Effect": "Allow",
+      "Action": "*",
+      "Resource": "*"
+    }]}}]
+  }]
+}

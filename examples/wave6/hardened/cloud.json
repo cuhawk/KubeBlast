@@ -1,0 +1,11 @@
+{
+  "resource": "projects/demo-project",
+  "bindings": [
+    {
+      "role": "roles/viewer",
+      "members": [
+        "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/demo-project.svc.id.goog/subject/ns/demo/sa/runner"
+      ]
+    }
+  ]
+}

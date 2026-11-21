@@ -4,7 +4,7 @@ from fnmatch import fnmatchcase
 from urllib.parse import unquote
 
 from ..models import CloudSecret, IAMRole, Inventory, Principal
-from .oidc_parser import parse_trust, sequence
+from .oidc_parser import parse_trust, sequence, workload_account
 
 DATA_REFERENCE = re.compile(r"^\$\{(data\.aws_iam_policy_document\.\w+)\.json\}$")
 REFERENCE = re.compile(r"^\$\{(aws_iam_\w+\.\w+)\.(?:name|arn|id)\}$")
@@ -38,8 +38,15 @@ class AWSParser:
         self.terraform = {}
         self.memberships = {}
         self.data = {}
+        self.associations = []
 
     def ingest(self, payload, source: str) -> None:
+        for association in [
+            *payload.get("associations", []),
+            *sequence(payload.get("association")),
+            *([payload] if {"roleArn", "namespace", "serviceAccount"} <= payload.keys() else []),
+        ]:
+            self.associations.append((association, source))
         for group in payload.get("GroupDetailList", []):
             name = group.get("GroupName") or group.get("Arn")
             if name:
@@ -159,6 +166,54 @@ class AWSParser:
 
     def finish(self, federated_accounts=()) -> None:
         self.resolve_hcl()
+        for kind, config, source in self.terraform.values():
+            if kind == "aws_eks_pod_identity_association":
+                self.associations.append(({
+                    "roleArn": self.terraform_identity(config.get("role_arn", "")),
+                    "namespace": config.get("namespace"),
+                    "serviceAccount": config.get("service_account"),
+                }, source))
+        for association, evidence in self.associations:
+            role = association.get("roleArn")
+            namespace = association.get("namespace")
+            name = association.get("serviceAccount")
+            if role not in self.roles or not all(
+                isinstance(part, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", part)
+                for part in (namespace, name)
+            ):
+                continue
+            policy, _ = self.roles[role]
+            grants = [
+                statement for statement in sequence(policy.get("Statement"))
+                if isinstance(statement.get("Principal"), dict)
+                and "pods.eks.amazonaws.com" in sequence(statement["Principal"].get("Service"))
+            ]
+            required = {"sts:assumerole", "sts:tagsession"}
+            allowed = set()
+            denied = set()
+            identity_tags = {"kubernetes-namespace": namespace, "kubernetes-service-account": name}
+            for statement in grants:
+                actions = [str(action).lower() for action in sequence(statement.get("Action"))]
+                conditions = statement.get("Condition", {})
+                for operator, values in conditions.items():
+                    if operator not in {"StringEquals", "StringLike"}:
+                        continue
+                    if any(
+                        key.startswith("aws:RequestTag/") and (tag := key.split("/", 1)[1]) in identity_tags
+                        and not (matches(identity_tags[tag], value) if operator == "StringLike"
+                                 else identity_tags[tag] in sequence(value))
+                        for key, value in values.items()
+                    ):
+                        break
+                else:
+                    if statement.get("Effect") == "Allow":
+                        allowed.update(action for action in required if matches(action, actions))
+                    elif statement.get("Effect") == "Deny" and not conditions:
+                        denied.update(action for action in required if matches(action, actions))
+            if required <= allowed - denied:
+                account = workload_account(self.inventory, namespace, name)
+                self.inventory.link(account, role, "aws_eks_pod_identity", evidence,
+                                    scope=f"{namespace}/{name}", conditional=True)
         for role, (policy, source) in self.roles.items():
             statements = sequence(policy.get("Statement"))
             parse_trust(statements, role, self.inventory, source)
@@ -184,12 +239,29 @@ class AWSParser:
                     for provider in providers:
                         exact = conditions.get("StringEquals", {}).get(f"{provider}:sub")
                         like = conditions.get("StringLike", {}).get(f"{provider}:sub", "*")
+                        audience = conditions.get("StringEquals", {}).get(f"{provider}:aud")
+                        audience_like = conditions.get("StringLike", {}).get(f"{provider}:aud")
+                        if audience is not None and "sts.amazonaws.com" not in sequence(audience):
+                            continue
+                        if audience_like is not None and not matches("sts.amazonaws.com", audience_like):
+                            continue
                         allowed = subject in sequence(exact) if exact is not None else matches(subject, like)
-                        if not allowed:
+                        if not allowed or any(
+                            deny.get("Effect") == "Deny" and not deny.get("Condition")
+                            and (deny.get("Principal") == "*" or (
+                                isinstance(deny.get("Principal"), dict) and any(
+                                    arn == "*" or (isinstance(arn, str) and arn.endswith(f"oidc-provider/{provider}"))
+                                    for arn in sequence(deny["Principal"].get("Federated"))
+                                )
+                            )) and matches("sts:assumerolewithwebidentity", [
+                                str(action).lower() for action in sequence(deny.get("Action"))
+                            ])
+                            for deny in statements
+                        ):
                             continue
                         self.inventory.link(
                             account, role, "aws_irsa", source, scope=subject,
-                            conditional=True, finding=exact is None,
+                            conditional=True, finding=exact is None or audience is None,
                         )
                         break
 

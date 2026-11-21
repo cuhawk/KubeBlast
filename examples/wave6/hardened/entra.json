@@ -1,0 +1,10 @@
+{
+  "clientId": "0ba6c3b9-42e7-472b-885a-7da0157cb585",
+  "federatedIdentityCredentials": [
+    {
+      "issuer": "https://issuer.example.invalid/demo/",
+      "subject": "system:serviceaccount:demo:runner",
+      "audiences": ["api://AzureADTokenExchange"]
+    }
+  ]
+}
