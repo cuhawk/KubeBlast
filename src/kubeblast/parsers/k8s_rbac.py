@@ -1,4 +1,6 @@
-from ..models import Inventory, K8sRole, K8sServiceAccount, PodWorkload, Principal
+from ..models import Inventory, K8sRole, PodWorkload, Principal
+
+from .oidc_parser import workload_account
 
 TEMPLATE_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"}
 
@@ -22,6 +24,10 @@ class KubernetesParser:
         self.documents = []
         self.aws_accounts = []
         self.gcp_accounts = []
+        self.azure_accounts = {}
+        self.namespace_profiles = {}
+        self.admitted_exposures = {}
+        self.identity_mounts = {}
         self.account_specs = {}
         self.workloads = {}
 
@@ -33,9 +39,7 @@ class KubernetesParser:
             self.documents.append((document, source))
 
     def account(self, namespace, name):
-        return self.inventory.add(K8sServiceAccount(
-            id=f"k8s:sa:{namespace}:{name}", label=f"{namespace}/{name}"
-        ))
+        return workload_account(self.inventory, namespace, name)
 
     def subject(self, subject, namespace):
         name = subject.get("name")
@@ -57,6 +61,7 @@ class KubernetesParser:
         roles = {("ClusterRole", "*", "cluster-admin"): [{
             "apiGroups": ["*"], "verbs": ["*"], "resources": ["*"]
         }]}
+        role_sources = {}
         bindings = []
         workloads = []
         for document, source in self.documents:
@@ -66,10 +71,15 @@ class KubernetesParser:
             if not name:
                 continue
             namespace = metadata.get("namespace", "default")
-            if kind == "ServiceAccount":
+            if kind == "Namespace":
+                labels = metadata.get("labels", {})
+                self.namespace_profiles[name] = labels.get("pod-security.kubernetes.io/enforce")
+            elif kind == "ServiceAccount":
                 account = self.account(namespace, name)
                 self.account_specs[account] = document
                 annotations = metadata.get("annotations", {})
+                if client := annotations.get("azure.workload.identity/client-id"):
+                    self.azure_accounts[namespace, name] = client
                 if role := annotations.get("eks.amazonaws.com/role-arn"):
                     self.aws_accounts.append((account, role, f"system:serviceaccount:{namespace}:{name}"))
                 if annotations.get("iam.gke.io/gcp-service-account"):
@@ -77,6 +87,7 @@ class KubernetesParser:
             elif kind in {"Role", "ClusterRole"}:
                 scope = "*" if kind == "ClusterRole" else namespace
                 roles[kind, scope, name] = document.get("rules", [])
+                role_sources[kind, scope, name] = source
                 self.role(kind, scope, name)
             elif kind in {"RoleBinding", "ClusterRoleBinding"}:
                 bindings.append((document, source, namespace))
@@ -86,6 +97,13 @@ class KubernetesParser:
         for document, source, namespace, name in workloads:
             self.workload(document, source, namespace, name)
 
+        for document, _, namespace in bindings:
+            for subject in document.get("subjects", []):
+                if (document["kind"] != "ClusterRoleBinding"
+                        or subject.get("kind") != "ServiceAccount" or subject.get("namespace")):
+                    self.subject(subject, namespace)
+
+        effective_roles = set()
         for document, source, namespace in bindings:
             ref = document.get("roleRef", {})
             name = ref.get("name")
@@ -103,8 +121,10 @@ class KubernetesParser:
                 if principal := self.subject(subject, namespace):
                     self.inventory.link(principal, role, "k8s_binding", source, scope=scope,
                                         finding=cluster_wide and name == "cluster-admin")
-            for rule in roles[key]:
-                self.permissions(role, rule, scope, roles, source)
+            if role not in effective_roles:
+                effective_roles.add(role)
+                for rule in roles[key]:
+                    self.permissions(role, rule, scope, roles, role_sources.get(key, source))
 
     def role(self, kind, scope, name):
         return self.inventory.add(K8sRole(
@@ -115,16 +135,23 @@ class KubernetesParser:
     def workload(self, document, source, namespace, name):
         kind = document["kind"]
         spec = document.get("spec", {})
+        pod_metadata = document.get("metadata", {})
         if kind == "CronJob":
             spec = spec.get("jobTemplate", {}).get("spec", {})
         if kind != "Pod":
-            spec = spec.get("template", {}).get("spec", {})
+            template = spec.get("template", {})
+            pod_metadata = template.get("metadata", {})
+            spec = template.get("spec", {})
         node = self.inventory.add(PodWorkload(
             id=f"k8s:workload:{namespace}:{kind}:{name}", label=f"{kind} {namespace}/{name}",
             entry=True,
         ))
         self.workloads[node] = (namespace, name, kind)
         account = self.account(namespace, spec.get("serviceAccountName", "default"))
+        self.identity_mounts[node] = (
+            account, source, namespace,
+            pod_metadata.get("labels", {}).get("azure.workload.identity/use") == "true",
+        )
         account_spec = self.account_specs.get(account, {})
         projected_token = any(
             "serviceAccountToken" in projection
@@ -143,19 +170,64 @@ class KubernetesParser:
             "k8s_hostpath": any("hostPath" in volume for volume in spec.get("volumes", [])),
             "k8s_privileged": any(c.get("securityContext", {}).get("privileged") is True for c in containers),
         }
-        for rule, detected in exposures.items():
-            if detected:
-                target = self.inventory.add(Principal(
-                    id=f"k8s:host:{namespace}:{kind}:{name}", label=f"Host of {namespace}/{name}", impact=8
+        profile = self.namespace_profiles.get(namespace)
+        blocked = profile in {"baseline", "restricted"}
+        if any(exposures.values()):
+            self.admitted_exposures[node] = not blocked
+            if blocked:
+                policy = self.inventory.add(Principal(
+                    id=f"k8s:podsecurity:{namespace}:{profile}", label=f"{namespace} {profile}",
                 ))
-                self.inventory.link(node, target, rule, source, scope=namespace,
-                                    finding=True, conditional=True)
+                if kind != "Pod":
+                    self.inventory.nodes[node] = self.inventory.nodes[node].model_copy(update={"entry": False})
+                self.inventory.link(policy, node, "k8s_podsecurity_enforced", source,
+                                    scope=namespace, traversable=False)
+        for rule, detected in exposures.items():
+            if not detected:
+                continue
+            target = self.inventory.add(Principal(
+                id=f"k8s:host:{namespace}:{kind}:{name}", label=f"Host of {namespace}/{name}", impact=8
+            ))
+            # Admission does not evict pods that are already running.
+            traversable = kind == "Pod" or not blocked
+            exposure = "k8s_privileged_daemonset" if kind == "DaemonSet" and rule == "k8s_privileged" else rule
+            self.inventory.link(node, target, exposure, source, scope=namespace,
+                                finding=traversable, traversable=traversable, conditional=True)
+
+    def finish_identity_mounts(self):
+        trusts = {}
+        for edge in self.inventory.edges:
+            if edge.rule in {"aws_irsa", "aws_eks_pod_identity", "gcp_workload_identity", "azure_entra_federated"}:
+                trusts.setdefault(edge.source, []).append(edge)
+        for node, (account, source, namespace, azure_enabled) in self.identity_mounts.items():
+            edges = trusts.get(account, [])
+            if any(edge.rule != "azure_entra_federated" or azure_enabled for edge in edges):
+                self.inventory.link(node, account, "k8s_workload_identity", source,
+                                    scope=namespace, conditional=True)
 
     def permissions(self, role, rule, scope, roles, source):
         names = rule.get("resourceNames", [])
+        if scope == "*" and any(
+            permits(rule, verb, "nodes/proxy") for verb in ("get", "create")
+        ):
+            for node_name in names or ["*"]:
+                target = self.inventory.add(Principal(
+                    id=f"k8s:node-proxy:{node_name}", label=f"Node proxy ({node_name})", impact=8,
+                ))
+                self.inventory.link(role, target, "k8s_node_proxy", source,
+                                    scope=node_name, conditional=True, finding=True)
         for workload, (namespace, name, kind) in self.workloads.items():
             if scope not in {"*", namespace}:
                 continue
+            if self.admitted_exposures.get(workload) and (
+                (not names and permits(rule, "create", "pods" if kind == "Pod" else "daemonsets",
+                                       "" if kind == "Pod" else "apps") and kind in {"Pod", "DaemonSet"})
+                or (kind == "DaemonSet" and (not names or name in names) and any(
+                    permits(rule, verb, "daemonsets", "apps") for verb in ("update", "patch")
+                ))
+            ):
+                self.inventory.link(role, workload, "k8s_workload_write", source,
+                                    scope=namespace, conditional=True, finding=True)
             if kind == "Pod" and (not names or name in names) and any(
                 permits(rule, verb, "pods/exec") for verb in ("create", "get")
             ):

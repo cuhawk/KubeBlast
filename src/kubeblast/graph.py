@@ -6,6 +6,7 @@ import networkx as nx
 import yaml
 
 from .models import Inventory
+from .parsers.azure_entra import parse_entra
 from .parsers.aws_iam import AWSParser
 from .parsers.gcp_iam import parse_gcp
 from .parsers.k8s_rbac import KubernetesParser
@@ -27,6 +28,7 @@ def read_inventory(paths: list[Path]) -> Inventory:
     aws = AWSParser(inventory)
     kubernetes = KubernetesParser(inventory)
     gcp = []
+    entra = []
     for path in sorted(files):
         evidence = str(path)
         try:
@@ -41,7 +43,14 @@ def read_inventory(paths: list[Path]) -> Inventory:
                     continue
                 if not isinstance(payload, dict):
                     raise ValueError("expected a mapping")
-                if "kind" in payload:
+                if (
+                    "federatedIdentityCredentials" in payload
+                    or ("issuer" in payload.get("properties", payload)
+                        and "subject" in payload.get("properties", payload))
+                    or ("value" in payload and ("appId" in payload or "clientId" in payload))
+                ):
+                    entra.append((payload, evidence))
+                elif "kind" in payload:
                     kubernetes.ingest(payload, evidence)
                 elif any(key in payload for key in ("bindings", "iamPolicy", "policy")):
                     gcp.append((payload, evidence))
@@ -60,6 +69,10 @@ def read_inventory(paths: list[Path]) -> Inventory:
     aws.finish(kubernetes.aws_accounts)
     for payload, evidence in gcp:
         parse_gcp(payload, inventory, evidence, kubernetes.gcp_accounts)
+    # Resolve individual subjects before expanding namespace-wide grants.
+    for payload, evidence in entra:
+        parse_entra(payload, inventory, evidence, kubernetes.azure_accounts)
+    kubernetes.finish_identity_mounts()
     return inventory
 
 
@@ -72,21 +85,21 @@ def build_graph(inventory: Inventory) -> nx.MultiDiGraph:
     return graph
 
 
-def analyze(inventory: Inventory, max_hops: int = 8) -> dict:
+def find_paths(graph: nx.MultiDiGraph, max_hops: int = 8) -> tuple[list[dict], dict]:
     if max_hops < 1:
         raise ValueError("max_hops must be positive")
-    graph = build_graph(inventory)
     routes = nx.DiGraph()
     routes.add_nodes_from(sorted(graph.nodes))
-    for edge in sorted(inventory.edges, key=lambda edge: (
-        edge.conditional, edge.rule, edge.evidence, edge.source, edge.target
+    for edge in sorted((data for _, _, data in graph.edges(data=True)), key=lambda edge: (
+        edge["conditional"], edge["rule"], edge["evidence"], edge["source"], edge["target"],
     )):
-        if edge.traversable and not routes.has_edge(edge.source, edge.target):
-            routes.add_edge(edge.source, edge.target, edge=edge)
+        source, target = edge["source"], edge["target"]
+        if edge["traversable"] and not routes.has_edge(source, target):
+            routes.add_edge(source, target, edge=edge)
     paths = []
     blast_radius = {}
-    for start, node in sorted(inventory.nodes.items()):
-        if not node.entry:
+    for start, node in sorted(graph.nodes(data=True)):
+        if not node["entry"]:
             continue
         shortest = nx.single_source_shortest_path(routes, start, cutoff=max_hops)
         reachable = sorted(
@@ -101,11 +114,16 @@ def analyze(inventory: Inventory, max_hops: int = 8) -> dict:
             edges = [routes[left][right]["edge"] for left, right in zip(route, route[1:])]
             paths.append({
                 "nodes": route,
-                "edges": [edge.model_dump() for edge in edges],
+                "edges": edges,
                 "impact": graph.nodes[target]["impact"],
-                "conditional": any(edge.conditional for edge in edges),
+                "conditional": any(edge["conditional"] for edge in edges),
             })
     paths.sort(key=lambda path: (-path["impact"], len(path["edges"]), path["nodes"]))
+    return paths, blast_radius
+
+
+def analyze(inventory: Inventory, max_hops: int = 8) -> dict:
+    paths, blast_radius = find_paths(build_graph(inventory), max_hops)
     return {
         "nodes": [node.model_dump() for node in inventory.nodes.values()],
         "edges": [edge.model_dump() for edge in inventory.edges],

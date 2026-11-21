@@ -1,3 +1,4 @@
+from collections import defaultdict, deque
 import json
 from pathlib import Path
 
@@ -10,13 +11,14 @@ def terraform_patch(findings: list[dict]) -> str:
     """Create a reviewable Terraform module for tightening existing policy documents."""
     aws = [edge for edge in findings if edge["rule"].startswith(("aws_", "github_"))]
     gcp = [edge for edge in findings if edge["rule"].startswith("gcp_")]
-    if not aws and not gcp:
+    azure = [edge for edge in findings if edge["rule"].startswith("azure_")]
+    if not aws and not gcp and not azure:
         return "# No cloud IAM findings.\n"
     parts = [
         "# Supply reviewed replacements for the affected identities below.",
         "# Apply the output documents at the existing policy resource addresses.",
     ]
-    for edge in aws + gcp:
+    for edge in aws + gcp + azure:
         evidence = json.dumps(edge["evidence"], ensure_ascii=True)
         parts.append(f"# {edge['rule']} in {evidence}")
     if aws:
@@ -130,6 +132,14 @@ def kubernetes_controls(findings: list[dict]) -> tuple[str, str]:
     for rule, (pattern, body) in pod_controls.items():
         if rule in kinds:
             add(rule.replace("_", "-"), ["Pod"], {"pattern": {"spec": pattern}}, body)
+    if "k8s_hostpath" in kinds:
+        add("k8s-hostpath-daemonset", ["DaemonSet"], {"foreach": [{
+            "list": "request.object.spec.template.spec.volumes || `[]`",
+            "pattern": {"X(hostPath)": "null"},
+        }]}, [
+            'some volume in object.get(input.request.object.spec.template.spec, "volumes", [])',
+            '"hostPath" in object.keys(volume)',
+        ])
     if "k8s_token_mount" in kinds:
         add("projected-service-account-token", ["Pod"], {"foreach": [{
             "list": "request.object.spec.volumes[].projected.sources[] || `[]`",
@@ -139,15 +149,18 @@ def kubernetes_controls(findings: list[dict]) -> tuple[str, str]:
             'some projection in object.get(object.get(volume, "projected", {}), "sources", [])',
             '"serviceAccountToken" in object.keys(projection)',
         ])
-    if "k8s_privileged" in kinds:
+    if kinds & {"k8s_privileged", "k8s_privileged_daemonset"}:
         for field in ("containers", "initContainers", "ephemeralContainers"):
-            add(f"privileged-{field.lower()}", ["Pod"], {"foreach": [{
-                "list": f"request.object.spec.{field} || `[]`",
-                "pattern": {"=(securityContext)": {"=(privileged)": False}},
-            }]}, [
-                f"some container in object.get(input.request.object.spec, {json.dumps(field)}, [])",
-                'object.get(object.get(container, "securityContext", {}), "privileged", false)',
-            ])
+            for resource, prefix in (("Pod", "spec"), ("DaemonSet", "spec.template.spec")):
+                if resource == "DaemonSet" and "k8s_privileged_daemonset" not in kinds:
+                    continue
+                add(f"privileged-{resource.lower()}-{field.lower()}", [resource], {"foreach": [{
+                    "list": f"request.object.{prefix}.{field} || `[]`",
+                    "pattern": {"=(securityContext)": {"=(privileged)": False}},
+                }]}, [
+                    f"some container in object.get(input.request.object.{prefix}, {json.dumps(field)}, [])",
+                    'object.get(object.get(container, "securityContext", {}), "privileged", false)',
+                ])
     if "k8s_binding" in kinds:
         add("cluster-admin-binding", ["ClusterRoleBinding"], {
             "deny": {"conditions": {"all": [{
@@ -159,11 +172,12 @@ def kubernetes_controls(findings: list[dict]) -> tuple[str, str]:
         "k8s_escalate": ("escalate", ["roles", "clusterroles"]),
         "k8s_impersonate": ("impersonate", ["serviceaccounts", "users", "groups"]),
         "k8s_exec": ("create", ["pods/exec", "*/exec"]),
+        "k8s_node_proxy": ("get", ["nodes/proxy", "*/proxy"]),
     }
     for rule, (verb, resources) in restrictions.items():
         if rule not in kinds:
             continue
-        verbs = [verb, "*"] if rule != "k8s_exec" else ["create", "get", "*"]
+        verbs = ["create", "get", "*"] if rule in {"k8s_exec", "k8s_node_proxy"} else [verb, "*"]
         resources = [*resources, "*"]
         groups = ["rbac.authorization.k8s.io", "*"] if rule in {"k8s_bind", "k8s_escalate"} else ["", "*"]
         add(rule.replace("_", "-"), ["Role", "ClusterRole"], {"foreach": [{
@@ -195,10 +209,171 @@ def kubernetes_controls(findings: list[dict]) -> tuple[str, str]:
 def write_remediation(report: dict, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     findings = report["findings"]
-    kyverno, rego = kubernetes_controls(findings)
+    cut = minimum_cut_set(report)
+    recommendations = findings + [edge for edge in cut["edges"] if edge not in findings]
+    kyverno, rego = kubernetes_controls(recommendations)
     for name, text in {
-        "iam.tf": terraform_patch(findings),
+        "iam.tf": terraform_patch(recommendations),
         "kyverno.yaml": kyverno,
         "kubeblast.rego": rego,
+        "validating-policy.yaml": validating_policy(recommendations),
+        "cut-set.json": json.dumps(cut, indent=2) + "\n",
     }.items():
         (directory / name).write_text(text, encoding="utf-8")
+
+
+def minimum_cut_set(report: dict, minimum_impact: int = 7) -> dict:
+    """Find a minimum-cardinality cut of all remediable entry/target pairs."""
+    edges = sorted(report["edges"], key=lambda edge: (
+        edge["source"], edge["target"], edge["rule"], edge["scope"],
+        edge["evidence"], edge["conditional"], edge["finding"], edge["traversable"],
+    ))
+    entries = sorted(node["id"] for node in report["nodes"] if node["entry"])
+    targets = {node["id"] for node in report["nodes"] if node["impact"] >= minimum_impact}
+    adjustable = {
+        index for index, edge in enumerate(edges)
+        if edge["rule"].startswith(("aws_", "github_", "gcp_", "azure_"))
+        or edge["rule"] in {
+            "k8s_binding", "k8s_bind", "k8s_escalate", "k8s_impersonate",
+            "k8s_exec", "k8s_workload_write", "k8s_node_proxy",
+        }
+    }
+    outgoing = defaultdict(list)
+    for index, edge in enumerate(edges):
+        if edge["traversable"]:
+            outgoing[edge["source"]].append((edge["target"], index))
+
+    def reachable(start, removed):
+        queue = deque([(start, 0)])
+        predecessors = {start: (None, None)}
+        while queue:
+            node, depth = queue.popleft()
+            if depth == report["max_hops"]:
+                continue
+            for target, index in outgoing[node]:
+                if index not in removed and target not in predecessors:
+                    predecessors[target] = node, index
+                    queue.append((target, depth + 1))
+        return predecessors
+
+    fixed = {
+        start: (targets & reachable(start, adjustable).keys()) - {start}
+        for start in entries
+    }
+
+    def witness(removed):
+        for start in entries:
+            predecessors = reachable(start, removed)
+            hit = (targets & predecessors.keys()) - fixed[start] - {start}
+            if not hit:
+                continue
+            node = min(hit)
+            candidates = []
+            while node != start:
+                node, index = predecessors[node]
+                if index in adjustable:
+                    candidates.append(index)
+            return candidates
+        return None
+
+    # Every feasible solution must remove at least one adjustable edge from
+    # the current witness. Branch on those edges and retain the best solution.
+    pending = [frozenset()]
+    seen = set()
+    best = None
+    while pending:
+        removed = pending.pop()
+        if removed in seen or (best is not None and len(removed) >= len(best)):
+            continue
+        seen.add(removed)
+        candidates = witness(removed)
+        if candidates is None:
+            best = tuple(sorted(removed))
+            continue
+        if best is not None:
+            # Edge-disjoint candidate sets each require a separate removal.
+            blocked = removed | set(candidates)
+            lower_bound = len(removed) + 1
+            while lower_bound < len(best) and (additional := witness(blocked)) is not None:
+                blocked |= set(additional)
+                lower_bound += 1
+            if lower_bound >= len(best):
+                continue
+        pending.extend(removed | {index} for index in reversed(sorted(candidates)))
+
+    return {
+        "minimum_impact": minimum_impact,
+        "max_hops": report["max_hops"],
+        "complete": not any(fixed.values()),
+        "edges": [edges[index] for index in best],
+        "unremediable_pairs": [
+            {"entry": start, "target": target} for start in entries for target in sorted(fixed[start])
+        ],
+    }
+
+
+def validating_policy(findings: list[dict]) -> str:
+    """Render the same admission checks as CEL-based Kyverno policies."""
+    checks = yaml.safe_load(kubernetes_controls(findings)[0])
+    if checks is None:
+        return "# No Kubernetes admission controls generated.\n"
+
+    def expression(validate):
+        if "deny" in validate:
+            return "object.roleRef.name != 'cluster-admin'"
+        if "pattern" in validate:
+            spec = validate["pattern"]["spec"]
+            if "volumes" in spec:
+                return "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))"
+            return "has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken"
+        loop = validate["foreach"][0]
+        if "deny" in loop:
+            conditions = loop["deny"]["conditions"]["all"]
+            verbs, resources, groups = (json.dumps(condition["value"]) for condition in conditions)
+            return (
+                f"!object.rules.exists(r, r.verbs.exists(v, v in {verbs}) && "
+                f"has(r.resources) && r.resources.exists(s, s in {resources}) && "
+                f"has(r.apiGroups) && r.apiGroups.exists(g, g in {groups}))"
+            )
+        if "X(hostPath)" in loop.get("pattern", {}):
+            return (
+                "!has(object.spec.template.spec.volumes) || "
+                "object.spec.template.spec.volumes.all(v, !has(v.hostPath))"
+            )
+        if "projected" in loop["list"]:
+            return (
+                "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.projected) || "
+                "v.projected.sources.all(s, !has(s.serviceAccountToken)))"
+            )
+        field = loop["list"].split(" || ", 1)[0].removeprefix("request.")
+        return (
+            f"!has({field}) || {field}.all(c, !has(c.securityContext) || "
+            "!has(c.securityContext.privileged) || !c.securityContext.privileged)"
+        )
+
+    resources = {
+        "Pod": ("", "v1", "pods"),
+        "DaemonSet": ("apps", "v1", "daemonsets"),
+        "ClusterRoleBinding": ("rbac.authorization.k8s.io", "v1", "clusterrolebindings"),
+        "Role": ("rbac.authorization.k8s.io", "v1", "roles"),
+        "ClusterRole": ("rbac.authorization.k8s.io", "v1", "clusterroles"),
+    }
+    policies = []
+    for rule in checks["spec"]["rules"]:
+        kinds = rule["match"]["any"][0]["resources"]["kinds"]
+        validate = rule["validate"]
+        policies.append({
+            "apiVersion": "policies.kyverno.io/v1",
+            "kind": "ValidatingPolicy",
+            "metadata": {"name": f"kubeblast-{rule['name']}"},
+            "spec": {
+                "validationActions": ["Audit"],
+                "matchConstraints": {"resourceRules": [
+                    {"apiGroups": [group], "apiVersions": [version],
+                     "operations": ["CREATE", "UPDATE"], "resources": [resource]}
+                    for group, version, resource in (resources[kind] for kind in kinds)
+                ]},
+                "validations": [{"expression": expression(validate), "message": validate["message"]}],
+            },
+        })
+    return yaml.safe_dump_all(policies, sort_keys=False)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .graph import analyze, read_inventory
 from .remediate import write_remediation
+from .sarif import render_sarif
 from .visualizer import render_html, render_markdown
 
 
@@ -12,13 +13,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("inputs", type=Path, nargs="+")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-hops", type=int, default=8)
+    parser.add_argument("--format", choices=("default", "sarif"), default="default")
     args = parser.parse_args(argv)
     try:
         report = analyze(read_inventory(args.inputs), args.max_hops)
         args.output.mkdir(parents=True, exist_ok=True)
-        (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        (args.output / "report.md").write_text(render_markdown(report), encoding="utf-8")
-        (args.output / "report.html").write_text(render_html(report), encoding="utf-8")
+        if args.format == "sarif":
+            (args.output / "report.sarif").write_text(
+                json.dumps(render_sarif(report), indent=2) + "\n", encoding="utf-8",
+            )
+        else:
+            (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            (args.output / "report.md").write_text(render_markdown(report), encoding="utf-8")
+            (args.output / "report.html").write_text(render_html(report), encoding="utf-8")
         write_remediation(report, args.output / "remediation")
     except (OSError, ValueError) as exc:
         parser.exit(2, f"kubeblast: {exc}\n")
